@@ -1,12 +1,12 @@
 # Terraform + Azure — Zero to Hero Journey
 
-This document is a running record of everything learned so far while building a production-style Terraform setup on Azure. It's written in simple English, with diagrams, so it can double as **interview prep** and as **onboarding documentation** for anyone else who joins this project.
+This document is a running record of everything learned so far while building a production-style Terraform setup on Azure. It's written in simple English, phase by phase, so it can double as **interview prep** and as **onboarding documentation** for anyone else who joins this project.
 
 ---
 
-## 1. The Big Picture — What We're Building
+# Phase 1: The Big Picture
 
-We are building infrastructure using **Terraform** (an Infrastructure as Code tool) on **Azure**, following a pattern used by real engineering teams:
+We are building infrastructure using **Terraform** (an Infrastructure as Code tool) on **Azure**, following a pattern real engineering teams use:
 
 - **Reusable modules** — small, generic building blocks (Resource Group, Networking, NSG, etc.)
 - **Environments** — separate folders (`dev`, `prd`) that call those modules with their own values
@@ -24,7 +24,7 @@ Later, this `modules/` folder can be split into its **own Git repository**, vers
 
 ---
 
-## 2. Core Terraform Concepts
+# Phase 2: Core Terraform Concepts
 
 | Term | Simple Meaning |
 |---|---|
@@ -50,7 +50,7 @@ Don't think of this as "temporary vs permanent." Think of it as: **who needs to 
 
 ---
 
-## 3. Repository Structure
+# Phase 3: Repository Structure & Remote State
 
 ```
 Terraform/
@@ -76,11 +76,7 @@ Terraform/
 
 **Key rule:** Modules never contain a `provider {}` block. Only the root (`environments/dev`) configures the provider — this is what makes a module portable and reusable by anyone.
 
----
-
-## 4. Remote State — Why and How
-
-### Why not just use local state?
+### Why remote state?
 
 If `terraform.tfstate` lives only on your laptop:
 - Nobody else can safely run Terraform on the same infrastructure
@@ -129,9 +125,7 @@ Each environment (`dev`, `prd`) uses a **different `key`**, so their state files
 
 ---
 
-## 5. The Module Pattern (Reusability)
-
-### The idea
+# Phase 4: The Module Pattern (Reusability)
 
 A module is like a library function. It doesn't know or care which application is calling it — it just takes inputs and builds resources.
 
@@ -173,7 +167,7 @@ The `?ref=v1.0.0` pins a specific version, so upgrading a module never silently 
 
 ---
 
-## 6. Networking Module — What We Built
+# Phase 5: Networking Module — VNet, Subnets
 
 ```mermaid
 flowchart TD
@@ -196,7 +190,7 @@ Every value that could change (VNet name, CIDR ranges, subnet names) is passed i
 
 ---
 
-## 7. Loops in Terraform — `for_each`
+# Phase 6: Loops in Terraform — `for_each`
 
 ### Why loops matter
 
@@ -244,7 +238,7 @@ Inside a `for_each` block:
 
 ---
 
-## 8. ⚠️ The Most Important Lesson: Changing a Resource's Address is Dangerous
+# Phase 7: ⚠️ The Most Important Lesson — Changing a Resource's Address is Dangerous
 
 ### What happened
 
@@ -282,18 +276,194 @@ This is the production-grade approach — committed to Git, so the migration hap
 
 ---
 
-## 9. Common Errors We Hit (and What They Taught Us)
+# Phase 8: NSG Rules — Three Ways to Write Them
+
+We needed each NSG (app, db, mgmt, pep) to have **different** inbound/outbound rules, using the **same reusable `nsg` module**. This turned out to need one of Terraform's trickier features. Here's the full journey, in plain English.
+
+## 8.1 The "for expression" — turning a list into a map
+
+Before we even get to rules, we hit this line:
+```hcl
+{ for r in var.security_rule : r.name => r }
+```
+This is called a **for expression**. It's a one-line loop that *builds a new value* (a map or a list), instead of creating resources.
+
+**Why do we need it?** `for_each` on a resource only accepts a **map** or a **set of strings** — never a plain list. Our rules were sitting in a list:
+```hcl
+[
+  { name = "Allow-HTTPS", priority = 100, ... },
+  { name = "Deny-All",    priority = 4096, ... }
+]
+```
+We must convert this list into a map first, so each item has a stable, unique key. That's what the for-expression does.
+
+**Reading it like a sentence:**
+
+| Piece | Meaning |
+|---|---|
+| `{ ... }` | Curly braces = "I am building a MAP" (square brackets `[ ]` would build a list instead) |
+| `for r in var.security_rule` | "Go through each item in the list, and call the current item `r` for now" (name is your choice — could be `rule`, `x`, anything) |
+| `:` | Separates "what I'm looping over" from "what to produce for each item" |
+| `r.name => r` | For each item: KEY = `r.name`, VALUE = the whole object `r` |
+
+**Simple example first** (exactly the plain-English version):
+```hcl
+{ for name in ["Ravi", "Priya", "Amit"] : name => true }
+```
+Produces:
+```hcl
+{
+  "Ravi"  = true
+  "Priya" = true
+  "Amit"  = true
+}
+```
+Each name from the list became a map key, with `true` as its value.
+
+**Now our real example:**
+```hcl
+{ for r in var.security_rule : r.name => r }
+```
+If `var.security_rule` is:
+```hcl
+[
+  { name = "Allow-HTTPS", priority = 100, direction = "Inbound", ... },
+  { name = "Deny-All",    priority = 4096, direction = "Inbound", ... }
+]
+```
+Result:
+```hcl
+{
+  "Allow-HTTPS" = { name = "Allow-HTTPS", priority = 100, direction = "Inbound", ... }
+  "Deny-All"    = { name = "Deny-All",    priority = 4096, direction = "Inbound", ... }
+}
+```
+Now every rule's own `name` field became the map key — and this map is safe to use with `for_each`.
+
+> ⚠️ This only works if every rule has a **unique `name`**, since map keys must be unique. Good news — this forces good practice anyway (every rule should have a clear, distinct name).
+
+## 8.2 Approach 1 — `dynamic` + `content` (rules nested inside the NSG)
+
+Our first working approach kept all rules **inside one NSG resource**, generated automatically:
+
+```hcl
+resource "azurerm_network_security_group" "nsg" {
+  name                = var.nsg_name
+  location            = var.location
+  resource_group_name = var.rg_name
+
+  dynamic "security_rule" {
+    for_each = var.security_rule
+    content {
+      name                        = security_rule.value.name
+      priority                    = security_rule.value.priority
+      direction                   = security_rule.value.direction
+      access                       = security_rule.value.access
+      protocol                     = security_rule.value.protocol
+      source_port_range            = security_rule.value.source_port_range
+      destination_port_range       = security_rule.value.destination_port_range
+      source_address_prefix        = security_rule.value.source_address_prefix
+      destination_address_prefix   = security_rule.value.destination_address_prefix
+    }
+  }
+}
+```
+
+**Why this was needed at all:** our first attempt was simply:
+```hcl
+security_rule = var.security_rule   # ❌ direct assignment — failed
+```
+This fails because Azure's `security_rule` attribute expects an **exact schema** (including plural fields like `source_port_ranges`, `destination_application_security_group_ids`, etc.) — even fields we never intended to use. A direct list assignment must match that schema perfectly, or Terraform rejects it.
+
+**Breaking down `dynamic`/`content`:**
+
+| Part | Meaning |
+|---|---|
+| `dynamic "security_rule"` | "Generate one or more `security_rule { }` nested blocks, automatically, instead of me writing each one by hand" |
+| `for_each = var.security_rule` | The list to loop over |
+| `content { ... }` | The template for ONE generated block — Terraform runs this once per list item |
+| `security_rule.value` | Inside `content`, Terraform auto-creates a temporary reference named after the block (`security_rule`) — `.value` = the current item in this loop pass |
+
+This literally **expands into** several manually-written `security_rule { }` blocks, one per rule — Terraform just generates them for you instead of you typing each one.
+
+**Downside:** all rules are bundled invisibly inside one NSG resource — you can't see individual rules in `terraform state list`.
+
+## 8.3 Approach 2 — Separate `azurerm_network_security_rule` resource (no `dynamic` needed)
+
+Instead of nesting rules inside the NSG, make each rule its **own resource**, linked to the NSG by name:
+
+```hcl
+resource "azurerm_network_security_group" "nsg" {
+  name                = var.nsg_name
+  location            = var.location
+  resource_group_name = var.rg_name
+}
+
+resource "azurerm_network_security_rule" "rule" {
+  for_each = { for r in var.security_rule : r.name => r }
+
+  name                        = each.value.name
+  priority                    = each.value.priority
+  direction                   = each.value.direction
+  access                       = each.value.access
+  protocol                     = each.value.protocol
+  source_port_range            = each.value.source_port_range
+  destination_port_range       = each.value.destination_port_range
+  source_address_prefix        = each.value.source_address_prefix
+  destination_address_prefix   = each.value.destination_address_prefix
+  resource_group_name          = var.rg_name
+  network_security_group_name  = azurerm_network_security_group.nsg.name
+}
+```
+
+**What's different here:**
+- No `dynamic`/`content` at all — this uses the plain `for_each` we already know from subnets/NSGs
+- The `{ for r in var.security_rule : r.name => r }` for-expression (Phase 8.1) converts the list to a map first, so `for_each` can use it
+- Each rule becomes its own visible, trackable resource: `module.nsg["app"].azurerm_network_security_rule.rule["Allow-HTTPS"]`
+- The rule connects to its NSG via `network_security_group_name = azurerm_network_security_group.nsg.name` — same linking pattern as our subnet-to-NSG association earlier
+
+## 8.4 Which approach is better?
+
+| | `dynamic` + `content` (nested) | Separate `azurerm_network_security_rule` resource |
+|---|---|---|
+| Handles different rules per NSG | ✅ Yes | ✅ Yes |
+| Needs `dynamic`/`content` syntax | Yes | No — just plain `for_each` |
+| Visibility in `terraform plan` / `state list` | Bundled inside NSG, less visible individually | Each rule is its own visible resource — easier to audit |
+| Common in real production repos | Yes, especially for small rule sets | Yes, especially when rules are managed/added independently or in bulk |
+
+**Our choice:** Approach 2 (separate resource) — because it avoids the less-intuitive `dynamic`/`content` syntax and gives better visibility into individual rules, which matters a lot when auditing security rules later.
+
+## 8.5 The actual rules we designed
+
+Architecture: Internet → Load Balancer → `app` subnet → (via Private Endpoint) → `pep` subnet → Azure Database for PostgreSQL (PaaS). `db` subnet is currently unused (reserved for future use), `mgmt` is left with Azure default rules for now.
+
+```mermaid
+flowchart LR
+    Internet((Internet)) -->|HTTPS 443| LB[Load Balancer]
+    LB -->|forwards traffic| AppSubnet[app subnet]
+    AppSubnet -->|Postgres 5432, via Private Link| PepSubnet[pep subnet - Private Endpoint]
+    PepSubnet -.->|private connection| PG[(Azure Database for PostgreSQL)]
+```
+
+- **app subnet:** allow 443 from Internet (via Load Balancer), allow Azure health probes (`AzureLoadBalancer` service tag), deny everything else
+- **pep subnet:** allow 5432 (Postgres) only from the `app` subnet's address range, deny everything else
+- **db subnet:** deny all inbound (reserved, unused for now)
+- **mgmt subnet:** left as Azure default rules for now (to be designed later — Bastion/VPN access)
+
+---
+
+# Phase 9: Common Errors We Hit (and What They Taught Us)
 
 | Error | Root Cause | Fix |
 |---|---|---|
 | `Required attribute "X" not specified` | Module's `variables.tf` requires an input that the caller (`main.tf`) never passed | Add the missing argument to the module block, or give the variable a `default` |
 | `Unsupported attribute ... this object does not have an attribute named "X"` | Referencing an output that doesn't exist, or using `.attribute` on a plain string (like `each.key.something`) | Check the module's `outputs.tf` for the real output name; use `each.value` for objects, `each.key` only as a plain string |
 | `a resource with the ID "..." already exists — needs to be imported` | Terraform's state doesn't know about a resource that already exists in Azure — often caused by changing a resource's address without migrating state first | Use `terraform state mv` or a `moved` block |
-| NSG created but `security_rule = (known after apply)` shows empty | No custom rules defined — NSG only enforces Azure's default rules (allow within VNet, deny from internet) | Add `azurerm_network_security_rule` resources (ideally via `for_each` over a `security_rules` variable) |
+| `Inappropriate value for attribute "security_rule": incorrect set element type...` | Tried to directly assign a list to `security_rule = var.security_rule` — the object type didn't match Azure's exact internal schema | Use `dynamic`/`content`, or better, a separate `azurerm_network_security_rule` resource |
 
 ---
 
-## 10. Interview-Style Q&A Recap
+# Phase 10: Interview-Style Q&A Recap
 
 **Q: What is Terraform state, and why does it matter?**
 A: State is Terraform's record of what infrastructure it has created and manages. It maps your code to real-world resource IDs. Without accurate state, Terraform can't know what to update, and might try to recreate things that already exist.
@@ -306,6 +476,12 @@ A: A variable is an external input — its value can be supplied from outside th
 
 **Q: What's the difference between `count` and `for_each`?**
 A: `count` uses a numeric index, which can cause unwanted resource recreation if items are added/removed from the middle of a list. `for_each` uses stable string keys, so only the specific added/removed key is affected — safer for named, meaningful resources.
+
+**Q: What is a "for expression" in Terraform?**
+A: A one-line loop that builds a new list or map from an existing collection, e.g. `{ for r in var.list : r.name => r }` converts a list into a map keyed by each item's `name`. Commonly used to prepare data for `for_each`, since `for_each` requires a map or a set of strings, not a plain list.
+
+**Q: What's the difference between a `dynamic` block and a separate resource with `for_each`?**
+A: A `dynamic` block generates multiple nested blocks *inside one resource* (e.g., several `security_rule { }` blocks inside one NSG). A separate resource with `for_each` creates multiple independent, individually trackable resources instead (e.g., each rule as its own `azurerm_network_security_rule`). The second approach is often easier to audit since each item is visible on its own in `terraform state list`.
 
 **Q: Why should modules not contain a `provider` block?**
 A: Provider configuration (auth, subscription, region defaults) is specific to whoever is calling the module, not to the module's logic. Keeping it out of the module keeps the module portable and reusable across different projects/subscriptions.
@@ -324,9 +500,9 @@ A: So consuming applications can upgrade deliberately, instead of automatically 
 
 ---
 
-## 11. What's Next
+# Phase 11: What's Next
 
-- [ ] Define NSG inbound/outbound rules (least-privilege — app, db, mgmt, pep each get only the access they need)
+- [ ] Finish `mgmt` subnet NSG rules (Bastion/VPN access design)
 - [ ] Compute layer (VM or App Service, depending on the application)
 - [ ] Key Vault for secrets management
 - [ ] Modules → separate Git repo + versioning (multi-repo pattern)
